@@ -1,3 +1,4 @@
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -78,92 +79,57 @@ def process_file(file_path):
     return dataDf, sort
 
 
-# Function to concatenate a chunk of DataFrames
 def concat_chunk(*df_list_chunk):
     """Concatenate a chunk of DataFrames, handling multiple argument formats."""
-    # If a single list-of-DataFrames was passed, unwrap it
     if len(df_list_chunk) == 1 and isinstance(df_list_chunk[0], list):
         df_list = df_list_chunk[0]
     else:
-        # Otherwise each DataFrame was passed as a separate arg
         df_list = list(df_list_chunk)
     return pd.concat(df_list, axis=0)
 
 
-# Function to parallelize the concatenation of DataFrames using MPIRE
 def parallel_concat(df_list, chunk_size=10000):
     """Concatenates a list of DataFrames in parallel using MPIRE."""
-    # Split the DataFrames into chunks (each chunk is a list of DataFrames)
     chunks = [df_list[i:i + chunk_size] for i in range(0, len(df_list), chunk_size)]
-
-    if os.environ.get('SLURM_CPUS_PER_TASK') is None:
-        cpus = os.cpu_count()
-    else:
-        cpus = int(os.environ['SLURM_CPUS_PER_TASK'])
-    # Create a WorkerPool using MPIRE for parallel processing
+    cpus = (int(os.environ['SLURM_CPUS_PER_TASK'])
+            if os.environ.get('SLURM_CPUS_PER_TASK') else os.cpu_count())
     with WorkerPool(n_jobs=cpus) as pool:
-        # Submit tasks to the pool for parallel concatenation
         result_chunks = pool.map(concat_chunk, chunks)
-
-    # Concatenate the resulting chunks into the final DataFrame
-    final_result = pd.concat(result_chunks, axis=0).reset_index(drop=True)
-
-    return final_result
+    return pd.concat(result_chunks, axis=0).reset_index(drop=True)
 
 
 def simParse(dir):
-    # Get the list of files
     filelist = os_sorted(glob.glob(dir + "/DATA*"))
-    # Initialize lists to store data for final concatenation
     data_list = []
     sortmax_list = []
 
     print('executing multithreaded data processing')
-    if os.environ.get('SLURM_CPUS_PER_TASK') is None:
-        cpus = os.cpu_count()
-    else:
-        cpus = int(os.environ['SLURM_CPUS_PER_TASK'])
+    cpus = (int(os.environ['SLURM_CPUS_PER_TASK'])
+            if os.environ.get('SLURM_CPUS_PER_TASK') else os.cpu_count())
 
-    # Use mpire Threading to process files in parallel
     with WorkerPool(n_jobs=cpus, start_method='threading') as pool:
         results = pool.map(process_file, filelist)
 
     print('finished data processing. begin list append')
-
-    # Collect results
     for dataDf, sort in results:
         data_list.append(dataDf)
         sortmax_list.append(sort)
 
     print('concat into dataframes')
-    # Concatenate all dataframes at once with parallel_concat
     data = parallel_concat(data_list)
     sortmax = parallel_concat(sortmax_list)
 
     print('finished dataframe processing')
-
     return data, sortmax
 
 
 def calculate_area_under_curve(data_df, time_column='Time(s)'):
-    """Calculates area under curve for each element vs. radius at each time.
-
-    Args:
-      data_df: pandas DataFrame containing data with 'Time', 'Radius', and element columns.
-      time_column: Name of the time column (default: 'Time').
-
-    Returns:
-      A DataFrame where each column is the area under curve for a species at each time.
-    """
-
     radius_column = data_df.columns[1]
-    timeArr = np.empty(len(data_df.columns) - 6)
-    element_names = []
     grouped_data = pd.DataFrame()
 
     for t, group_df in data_df.groupby(time_column):
-        timeArr.fill(t)
         areas = []
+        element_names = []
         for i in range(5, len(data_df.columns) - 1):
             elements = group_df.iloc[:, i]
             radius = group_df[radius_column]
@@ -171,27 +137,26 @@ def calculate_area_under_curve(data_df, time_column='Time(s)'):
             areas.append(area)
             element_names.append(group_df.columns[i])
 
-        header = 'Area Under Curve: ' + str(t)
+        header = f'Area Under Curve: {t}'
         area_data = pd.DataFrame({header: areas})
-
         if 'Species' in grouped_data:
             grouped_data = pd.concat([grouped_data, area_data], axis=1)
         else:
-            group_data = pd.DataFrame({'Species': element_names})
-            grouped_data = pd.concat([group_data, area_data], axis=1)
+            grouped_data = pd.DataFrame({'Species': element_names})
+            grouped_data = pd.concat([grouped_data, area_data], axis=1)
             grouped_data = grouped_data.head(len(element_names))
 
     return grouped_data
 
 
 def graphScurve(file_path, df):
-    fig = px.scatter(df, x='Mass flow rate(g/s)', y='Tmax(K)', hover_data=['FileName'], template='plotly_dark')
+    fig = px.scatter(df, x='Mass flow rate(g/s)', y='Tmax(K)',
+                     hover_data=['FileName'], template='plotly_dark')
     with open(f'{file_path}/a_scurve.html', 'w') as f:
         f.write(pio.to_html(fig, full_html=False, auto_play=False))
 
 
 def simGraph(file_path, sm, df):
-    # first plot – your “S-curve” of maxima
     fig1 = px.scatter(
         sm,
         x='Time(s)',
@@ -201,16 +166,12 @@ def simGraph(file_path, sm, df):
         template='plotly_dark'
     )
 
-    # second plot – your animated species vs. radius
     colKeepy = ['Temperature(K)', 'C2H4', 'O2', 'N2', 'H2O',
                 'CO2', 'CH', 'CHA', 'OH', 'OHA']
-
-    # Filter to only those columns actually present
     value_vars = [c for c in colKeepy if c in df.columns]
 
-    # melt into long form:
     df_long = df.melt(
-        id_vars=[col for col in ['Radius(cm)', 'Time(s)', 'FileName'] if col in df.columns],
+        id_vars=[c for c in ['Radius(cm)', 'Time(s)', 'FileName'] if c in df.columns],
         value_vars=value_vars,
         var_name='Species',
         value_name='Value'
@@ -236,34 +197,20 @@ def append2sortmax(sortmax_df, textfile):
 
 
 if __name__ == "__main__":
+    start = time.perf_counter()
+
     dir = "/Users/ryanmattana/Desktop/SPAM/sample data"
-    # file_path = input()
-    print(f'Directory Input:{dir}')
+    print(f'Directory Input: {dir}')
 
     dataDf, sortmax = simParse(dir)
 
     dataDf.to_pickle(f'{dir}//dataDf.pkl')
     sortmax.to_pickle(f'{dir}//sortmax.pkl')
 
-    ###
-
     print('Making S-Curve Graph')
     graphScurve(dir, sortmax)
     print('Making simGraph')
     simGraph(dir, sortmax, dataDf)
 
-    # For combining up and down
-    # dataDfdwn=pd.read_pickle(f"{dir}/dataDfdwn.pkl")
-    # sortmaxdwn=pd.read_pickle(f"{dir}/sortmaxdwn.pkl")
-    # dataDfup=pd.read_pickle(f"{dir}/dataDfup.pkl")
-    # sortmaxup=pd.read_pickle(f"{dir}/sortmaxup.pkl")
-    # dataDf = pd.concat([dataDfdwn,dataDfup])
-    # sortmax = pd.concat([sortmaxdwn, sortmaxup])
-    # sortmax.to_csv(f"{dir}/sortmax.csv",sep=',', header=True , encoding ='utf-8')
-
-    # temp = data['Temperature(K)']
-    # radius = data['Radius(cm)']
-    # plt.scatter(radius, temp)
-    # plt.savefig('graph.jpg')
-    # AreaDF = calculate_area_under_curve(data, 'Time(s)')
-    # print(AreaDF)
+    end = time.perf_counter()
+    print(f"Total execution time: {end - start:.3f} seconds")
