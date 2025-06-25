@@ -1,0 +1,360 @@
+# ==============================================================================
+# SCRIPT OVERVIEW
+#
+# This script is designed for high-performance processing of scientific simulation
+# data. Its primary function is to read a collection of text-based data files
+# from a specified directory, each representing a snapshot in time of a simulation.
+# It uses the Polars library to efficiently parse these files, extract metadata from
+# headers, and load the main numerical data.
+#
+# Key operations include:
+# 1. Parsing each file to create two DataFrames: one with the full dataset and
+#    another with a summary of key maximum values (e.g., max temperature).
+# 2. Aggregating the results from all files into two master DataFrames.
+# 3. Calculating the area under the curve for various chemical species over time.
+# 4. Generating and saving interactive HTML graphs using Plotly Express to
+#    visualize the results, including an "S-Curve" of temperature vs. mass flow
+#    rate and animated plots of species concentrations.
+#
+# The script leverages Polars' internal parallelization and efficient memory
+# management, making it significantly faster than traditional pandas-based approaches
+# for this type of I/O- and CPU-bound task.
+#
+# OPTIMIZATION NOTE: This version has been refactored to use Polars' lazy
+# execution model. Instead of executing operations immediately (eagerly), it
+# builds an optimized query plan. The actual computation is deferred until the
+# .collect() method is called, allowing for significant performance gains.
+# ==============================================================================
+
+import numpy as np
+import polars as pl
+import plotly.express as px
+import plotly.io as pio
+import glob
+import os
+from natsort import os_sorted
+from itertools import islice
+import re
+import io
+import time
+
+
+# ==============================================================================
+# POLARS-BASED DATA PROCESSING FUNCTIONS (LAZY EXECUTION)
+#
+# The original eager Polars functions have been replaced with these lazy
+# versions. The core logic is the same, but operations now build a query plan
+# instead of executing immediately.
+# ==============================================================================
+
+def process_file_pl_lazy(file_path):
+    """
+    Processes a single data file using Polars' lazy API.
+
+    This function reads file metadata, then sets up a lazy query to load the
+    main data. It defines transformations and aggregations on a LazyFrame,
+    which are only executed when .collect() is called later.
+
+    Args:
+        file_path (str): The path to the input data file.
+
+    Returns:
+        tuple[pl.LazyFrame, pl.LazyFrame]: A tuple containing two Polars LazyFrames:
+        - The first represents the plan for the full dataset.
+        - The second represents the plan for the summary of key maximum values.
+    """
+
+    def parse_header_line(line):
+        """
+        Robustly parses a header line to extract a label and a floating point value.
+        This regex looks for any text followed by whitespace and a number in
+        scientific notation at the end of the line.
+        """
+        match = re.match(r'(.*?)\s+([-\d.E+]+)$', line.strip())
+        if match:
+            label, value_str = match.groups()
+            return label.strip(), float(value_str)
+        else:
+            raise ValueError(f"Could not parse header line format: '{line.strip()}'")
+
+    with open(file_path, 'r') as f:
+        lines = f.readlines()
+
+    header_lines = lines[:14]
+    try:
+        flowrate_str, flowrate = parse_header_line(header_lines[12])
+        time_str, time_val = parse_header_line(header_lines[13])
+    except (ValueError, IndexError) as e:
+        raise type(e)(f"Error parsing header in {os.path.basename(file_path)}: {e}")
+
+    filename = os.path.basename(file_path)
+
+    header = re.sub(r'\s+', ',', lines[14].strip())
+    data_rows = [re.sub(r'\s+', ',', line.strip()) for line in lines[15:] if line.strip()]
+    csv_buffer = io.StringIO(header + '\n' + '\n'.join(data_rows))
+
+    # Eagerly read the buffer once to infer the schema and identify fully null columns.
+    # This is a pragmatic approach for schema discovery.
+    df_temp = pl.read_csv(csv_buffer, separator=',')
+    all_null_cols = [col for col in df_temp.columns if df_temp[col].is_null().all()]
+
+    # ******** FIX: START ********
+    # Reset the buffer's cursor to the beginning (position 0) so it can be read again.
+    # This is crucial because the pl.read_csv above just read it to the end.
+    csv_buffer.seek(0)
+    # ******** FIX: END ********
+
+    # Now, perform the lazy scan on the reset buffer.
+    lf = pl.scan_csv(csv_buffer, separator=',')
+
+    # Lazily drop the identified null columns.
+    lf = lf.drop(all_null_cols)
+
+
+    # --- Create the lazy plan for the summary DataFrame ('sortmax') ---
+    aggs = [
+        pl.col('Temperature(K)').max().alias('Tmax(K)'),
+        pl.col('Radius(cm)').gather(pl.col('Temperature(K)').arg_max()).alias('R_Tmax(cm)')
+    ]
+
+    # Use the columns from the eagerly read df_temp to safely build expressions.
+    for species in ['CH', 'CHA', 'OH', 'OHA']:
+        if species in df_temp.columns:
+            aggs.append(
+                pl.col('Radius(cm)').gather(pl.col(species).arg_max()).alias(f'R_{species}max(cm)')
+            )
+
+    sort_lf = lf.select(aggs).with_columns(
+        pl.lit(time_val).alias(time_str),
+        pl.lit(flowrate).alias(flowrate_str),
+        pl.lit(filename).alias('FileName')
+    )
+
+    # --- Create the lazy plan for the main data DataFrame ---
+    data_lf = lf.with_columns(
+        pl.lit(time_val).alias(time_str),
+        pl.lit(filename).alias('FileName')
+    )
+
+    final_order = [time_str, 'FileName'] + [col for col in df_temp.columns if col not in all_null_cols]
+    data_lf = data_lf.select(final_order)
+
+    return data_lf, sort_lf
+
+
+def simParse_pl_lazy(directory):
+    """
+    Lazily parses all simulation files in a directory using Polars.
+
+    This function finds all 'DATA*' files, creates a lazy plan for each one
+    using `process_file_pl_lazy`, and then concatenates the plans into two
+    master LazyFrames. No data is processed at this stage.
+
+    Args:
+        directory (str): The directory containing the data files.
+
+    Returns:
+        tuple[pl.LazyFrame, pl.LazyFrame]: A tuple containing the combined
+        lazy plans for the data and summary statistics.
+    """
+    filelist = os_sorted(glob.glob(os.path.join(directory, "DATA*")))
+    if not filelist:
+        print(f"Warning: No 'DATA*' files found in directory: {directory}")
+        return pl.LazyFrame(), pl.LazyFrame()
+
+    lazy_data_list = []
+    lazy_sortmax_list = []
+
+    print(f'Starting Polars lazy plan construction for {len(filelist)} files...')
+
+    for file_path in filelist:
+        try:
+            data_lf, sort_lf = process_file_pl_lazy(file_path)
+            lazy_data_list.append(data_lf)
+            lazy_sortmax_list.append(sort_lf)
+        except Exception as e:
+            print(f"Skipping file {os.path.basename(file_path)} due to error: {e}")
+
+    if not lazy_data_list:
+        print("No files were successfully planned.")
+        return pl.LazyFrame(), pl.LazyFrame()
+
+    print('Concatenating lazy plans...')
+    data_lazy = pl.concat(lazy_data_list, how='diagonal')
+    sortmax_lazy = pl.concat(lazy_sortmax_list, how='diagonal')
+
+    print('Finished constructing lazy query plans.')
+    return data_lazy, sortmax_lazy
+
+
+def calculate_area_under_curve_pl(data_lf, time_column='Time(s)'):
+    """
+    Defines the lazy calculation for the area under the curve for each chemical
+    species vs. radius, grouped by time.
+
+    Args:
+        data_lf (pl.LazyFrame): The lazy input frame with time, radius, and species data.
+        time_column (str): The name of the time column.
+
+    Returns:
+        pl.LazyFrame: A lazy frame representing the pivoted AUC calculations.
+    """
+    print("Defining lazy plan for area under the curve...")
+    schema = data_lf.collect_schema()
+    if 'Radius(cm)' not in schema:
+        print("Input LazyFrame is missing 'Radius(cm)' column. Cannot calculate AUC.")
+        return pl.LazyFrame()
+
+    id_vars = {time_column, 'Radius(cm)', 'FileName', 'Temperature(K)', 'Mass flow rate(g/s)'}
+    element_cols = [
+        col for col, dtype in schema.items()
+        if col not in id_vars and dtype in pl.NUMERIC_DTYPES
+    ]
+
+    if not element_cols:
+        print("No species columns found to calculate area under curve.")
+        return pl.LazyFrame()
+
+    def trapz_integral(series_struct):
+        y = series_struct.struct.field(element)
+        x = series_struct.struct.field('Radius(cm)')
+        sorted_indices = x.arg_sort()
+        return np.trapz(y.gather(sorted_indices).to_numpy(), x.gather(sorted_indices).to_numpy())
+
+    auc_aggs = []
+    for element in element_cols:
+        auc_aggs.append(
+            pl.struct([element, 'Radius(cm)'])
+            .apply(trapz_integral, return_dtype=pl.Float64)
+            .alias(f"AUC_{element}")
+        )
+
+    grouped_lazy = data_lf.group_by(time_column).agg(auc_aggs)
+
+    return grouped_lazy.melt(id_vars=[time_column]).pivot(
+        values="value", index="variable", columns=time_column
+    )
+
+
+def graphScurve_pl(file_path, df):
+    """Generates and saves a scatter plot for the S-Curve."""
+    if df.is_empty():
+        print("S-Curve DataFrame is empty, skipping graph generation.")
+        return
+    print("Generating S-Curve graph...")
+    fig = px.scatter(
+        df.to_pandas(), # Plotly works best with pandas
+        x='Mass flow rate(g/s)',
+        y='Tmax(K)',
+        hover_data=['FileName'],
+        template='plotly_dark',
+        title='S-Curve: Max Temperature vs. Mass Flow Rate'
+    )
+    output_path = os.path.join(file_path, 'a_scurve.html')
+    with open(output_path, 'w') as f:
+        f.write(pio.to_html(fig, full_html=False, auto_play=False))
+    print(f"S-Curve graph saved to {output_path}")
+
+
+def simGraph_pl(file_path, sm_df, data_df):
+    """Generates and saves summary and animated graphs."""
+    if sm_df.is_empty() or data_df.is_empty():
+        print("Input DataFrames are empty, skipping simulation graph generation.")
+        return
+
+    print("Generating simulation summary and animated graphs...")
+    # --- Graph 1: Summary Plot ---
+    y_cols = [c for c in sm_df.columns if 'max' in c.lower() and c != 'FileName']
+    fig1 = px.scatter(
+        sm_df.to_pandas(), # Plotly works best with pandas
+        x='Time(s)',
+        y=y_cols,
+        hover_data=['FileName'],
+        title='Sorted Maximums Over Time',
+        template='plotly_dark'
+    )
+
+    # --- Graph 2: Animated Plot ---
+    colKeepy = ['Temperature(K)', 'C2H4', 'O2', 'N2', 'H2O', 'CO2', 'CH', 'CHA', 'OH', 'OHA']
+    value_vars = [c for c in colKeepy if c in data_df.columns]
+    id_vars = [c for c in ['Radius(cm)', 'Time(s)', 'FileName'] if c in data_df.columns]
+
+    df_long = data_df.unpivot(
+        index=id_vars,
+        on=value_vars,
+        variable_name='Species',
+        value_name='Value'
+    )
+
+    fig2 = px.scatter(
+        df_long.to_pandas(), # Plotly works best with pandas
+        x='Radius(cm)',
+        y='Value',
+        color='Species',
+        animation_frame='Time(s)',
+        title='Animated Species Profile vs. Radius',
+        template='plotly_dark'
+    )
+
+    output_path = os.path.join(file_path, 'a_graph.html')
+    with open(output_path, 'w') as f:
+        f.write("<h1>Sorted Maximums Plot</h1>")
+        f.write(pio.to_html(fig1, full_html=False, auto_play=False))
+        f.write("<h1>Animated Species Plot</h1>")
+        f.write(pio.to_html(fig2, full_html=False, auto_play=False))
+    print(f"Simulation graphs saved to {output_path}")
+
+
+if __name__ == "__main__":
+    num_iterations = 10
+    all_durations = []
+
+    target_dir = "/Users/ryanmattana/Desktop/SPAM/sample data"
+    print(f'Directory Input: {target_dir}')
+
+    for i in range(num_iterations):
+        print(f"\n----- Starting Iteration {i + 1}/{num_iterations} -----")
+        start_time = time.monotonic()
+
+        # Build the lazy query plans.
+        dataLf_lazy, sortmax_lazy = simParse_pl_lazy(target_dir)
+
+        # ******** FIX: START ********
+        # Use .collect_schema() to check if the lazy plans are valid without
+        # triggering a PerformanceWarning. An empty schema evaluates to False.
+        if dataLf_lazy.collect_schema() and sortmax_lazy.collect_schema():
+        # ******** FIX: END ********
+
+            print("Executing lazy plan and collecting results...")
+            dataDf_pl = dataLf_lazy.collect()
+            sortmax_pl = sortmax_lazy.collect()
+            print("Execution finished. Data is now in memory.")
+
+            data_pickle_path = os.path.join(target_dir, 'dataDf.pkl')
+            sortmax_pickle_path = os.path.join(target_dir, 'sortmax.pkl')
+
+            print(f"Saving data to {data_pickle_path}")
+            dataDf_pl.to_pandas().to_pickle(data_pickle_path)
+
+            print(f"Saving summary data to {sortmax_pickle_path}")
+            sortmax_pl.to_pandas().to_pickle(sortmax_pickle_path)
+
+            graphScurve_pl(target_dir, sortmax_pl)
+            simGraph_pl(target_dir, sortmax_pl, dataDf_pl)
+
+        else:
+            print("Processing finished with no data. Exiting.")
+
+        end_time = time.monotonic()
+        duration = end_time - start_time
+        all_durations.append(duration)
+        print(f"----- Iteration {i + 1} finished in {duration:.3f} seconds -----")
+
+    if all_durations:
+        average_time = sum(all_durations) / len(all_durations)
+        print("\n================= PERFORMANCE SUMMARY =================")
+        print(f"All run times (seconds): {[round(d, 3) for d in all_durations]}")
+        print(f"Average execution time over {num_iterations} iterations: {average_time:.3f} seconds")
+        print("=====================================================")
+    else:
+        print("\nNo iterations were successfully completed.")
