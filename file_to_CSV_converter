@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+import os
+import re
+from glob import glob
+
+import pandas as pd
+
+def count_header_lines(file_path: str, data_start_pattern: str = r'^\s*Radius') -> int:
+    # opens the file path and detects first line from table
+    """
+    Scan until the first line that starts with "Radius" and return
+    how many lines precede it.
+    """
+    with open(file_path, 'r') as f:
+        for idx, line in enumerate(f):
+            if re.match(data_start_pattern, line):
+                return idx
+    return 0
+
+
+
+def convert_file(input_path: str, output_path: str):
+    # determines how many header lines to skip
+    n_skip = count_header_lines(input_path)
+
+    # read the data block, splitting on any run of whitespace
+    df = pd.read_csv(
+        input_path,
+        skiprows=n_skip,
+        sep=r"\s+",             # raw‐string regex for whitespace
+        header=0,               # first non‐skipped line = column names
+        na_values=['********'], # treat ******** as NaN
+        engine='python'         # required when using regex sep
+    )
+
+    # write to CSV from previous data type
+    df.to_csv(output_path, index=False)
+    print(f"✔ {os.path.basename(input_path)} → {os.path.basename(output_path)}")
+
+def main():
+    src_dir = '/Users/ryanmattana/Desktop/SPAM/sample data' #Change this depending on file directory
+    dst_dir = '/Users/ryanmattana/Desktop/SPAM/sample data csv'
+    os.makedirs(dst_dir, exist_ok=True)
+
+    for in_path in sorted(glob(os.path.join(src_dir, 'DATA*'))):
+        base = os.path.basename(in_path)
+        out_path = os.path.join(dst_dir, f"{base}.csv")
+        try:
+            convert_file(in_path, out_path)
+        except Exception as e:
+            print(f"✖ Failed on {base}: {e}")
+
+if __name__ == '__main__':
+    main()
