@@ -1,0 +1,321 @@
+import numpy as np
+import polars as pl
+import plotly.express as px
+import plotly.io as pio
+import glob
+import os
+from natsort import os_sorted
+from itertools import islice
+import re
+import io
+import time
+
+
+# ==============================================================================
+# POLARS-BASED DATA PROCESSING FUNCTIONS
+#
+# The original pandas-based functions have been replaced with these more
+# efficient versions using the Polars library. The manual parallelization
+# with MPIRE is no longer needed as Polars handles parallel operations
+# internally.
+# ==============================================================================
+
+def process_file_pl(file_path):
+    """
+    Processes a single data file using Polars.
+
+    This function reads file metadata from the header, then loads the main
+    data into a Polars DataFrame. It calculates summary statistics (like max
+    temperature) efficiently using Polars' built-in expression API.
+
+    Args:
+        file_path (str): The path to the input data file.
+
+    Returns:
+        tuple[pl.DataFrame, pl.DataFrame]: A tuple containing two Polars DataFrames:
+        - The first contains the full data from the file.
+        - The second contains a one-row summary of key maximum values.
+    """
+
+    def parse_header_line(line):
+        """
+        Robustly parses a header line to extract a label and a floating point value.
+        This regex looks for any text followed by whitespace and a number in
+        scientific notation at the end of the line.
+        """
+        match = re.match(r'(.*?)\s+([-\d.E+]+)$', line.strip())
+        if match:
+            label, value_str = match.groups()
+            return label.strip(), float(value_str)
+        else:
+            raise ValueError(f"Could not parse header line format: '{line.strip()}'")
+
+    # Read the file once
+    with open(file_path, 'r') as f:
+        lines = f.readlines()
+
+    # --- Header Parsing ---
+    header_lines = lines[:14]
+    try:
+        flowrate_str, flowrate = parse_header_line(header_lines[12])
+        time_str, time_val = parse_header_line(header_lines[13])
+    except (ValueError, IndexError) as e:
+        raise type(e)(f"Error parsing header in {os.path.basename(file_path)}: {e}")
+
+    filename = os.path.basename(file_path)
+
+    # --- Data Pre-processing ---
+    # Polars' read_csv is very strict with delimiters. To handle variable whitespace,
+    # we pre-process the data lines to create a clean, uniformly delimited format.
+
+    # Extract header from the 15th line and normalize its whitespace
+    header = re.sub(r'\s+', ',', lines[14].strip())
+
+    # Process the rest of the data lines
+    data_rows = [re.sub(r'\s+', ',', line.strip()) for line in lines[15:] if line.strip()]
+
+    # Combine header and data into a single CSV string
+    csv_buffer = io.StringIO(header + '\n' + '\n'.join(data_rows))
+
+    # Read the cleaned data using Polars with a comma separator
+    df = pl.read_csv(csv_buffer, separator=',')
+
+    # Drop columns that are entirely null, which can result from trailing spaces
+    all_null_cols = [col for col in df.columns if df[col].is_null().all()]
+    df = df.drop(all_null_cols)
+
+    # --- Create the summary DataFrame ('sortmax') using Polars aggregations ---
+    aggs = [
+        pl.col('Temperature(K)').max().alias('Tmax(K)'),
+        pl.col('Radius(cm)').gather(pl.col('Temperature(K)').arg_max()).alias('R_Tmax(cm)')
+    ]
+
+    # Conditionally add aggregations for optional species columns
+    for species in ['CH', 'CHA', 'OH', 'OHA']:
+        if species in df.columns:
+            aggs.append(
+                pl.col('Radius(cm)').gather(pl.col(species).arg_max()).alias(f'R_{species}max(cm)')
+            )
+
+    # Execute all aggregations in a single pass
+    sort_df = df.select(aggs).with_columns(
+        pl.lit(time_val).alias(time_str),
+        pl.lit(flowrate).alias(flowrate_str),
+        pl.lit(filename).alias('FileName')
+    )
+
+    # --- Create the main data DataFrame ---
+    data_df = df.with_columns(
+        pl.lit(time_val).alias(time_str),
+        pl.lit(filename).alias('FileName')
+    )
+
+    # Reorder columns to have metadata first
+    final_order = [time_str, 'FileName'] + [col for col in df.columns]
+    data_df = data_df.select(final_order)
+
+    return data_df, sort_df
+
+
+def simParse_pl(directory):
+    """
+    Parses all simulation files in a directory using Polars.
+
+    This function finds all 'DATA*' files, processes them individually
+    using `process_file_pl`, and then concatenates the results into two
+    main DataFrames. Polars' `concat` is highly efficient.
+
+    Args:
+        directory (str): The directory containing the data files.
+
+    Returns:
+        tuple[pl.DataFrame, pl.DataFrame]: A tuple containing the combined
+        data and the combined summary statistics as Polars DataFrames.
+    """
+    filelist = os_sorted(glob.glob(os.path.join(directory, "DATA*")))
+    if not filelist:
+        print(f"Warning: No 'DATA*' files found in directory: {directory}")
+        return pl.DataFrame(), pl.DataFrame()
+
+    data_list = []
+    sortmax_list = []
+
+    print(f'Starting Polars processing for {len(filelist)} files...')
+
+    # Loop through files and process them.
+    for file_path in filelist:
+        try:
+            data_df, sort_df = process_file_pl(file_path)
+            data_list.append(data_df)
+            sortmax_list.append(sort_df)
+        except Exception as e:
+            # This handles errors during file reading or processing, e.g., malformed files.
+            print(f"Skipping file {os.path.basename(file_path)} due to error: {e}")
+
+    if not data_list:
+        print("No files were successfully processed.")
+        return pl.DataFrame(), pl.DataFrame()
+
+    print('Concatenating results into final DataFrames...')
+    data = pl.concat(data_list, how='diagonal')
+    sortmax = pl.concat(sortmax_list, how='diagonal')
+
+    print('Finished DataFrame processing with Polars.')
+    return data, sortmax
+
+
+def calculate_area_under_curve_pl(data_df, time_column='Time(s)'):
+    """
+    Calculates the area under the curve for each chemical species vs. radius,
+    grouped by time, using Polars and NumPy.
+
+    Args:
+        data_df (pl.DataFrame): The input DataFrame with time, radius, and species data.
+        time_column (str): The name of the time column.
+
+    Returns:
+        pl.DataFrame: A pivoted DataFrame with species as rows and time-based
+        area-under-curve calculations as columns.
+    """
+    print("Calculating area under the curve...")
+    if data_df.is_empty() or 'Radius(cm)' not in data_df.columns:
+        print("Input DataFrame is empty or missing 'Radius(cm)' column. Cannot calculate AUC.")
+        return pl.DataFrame()
+
+    # Dynamically identify columns containing species data
+    id_vars = {time_column, 'Radius(cm)', 'FileName', 'Temperature(K)', 'Mass flow rate(g/s)'}
+    element_cols = [
+        col for col in data_df.columns
+        if col not in id_vars and data_df[col].dtype in pl.NUMERIC_DTYPES
+    ]
+
+    if not element_cols:
+        print("No species columns found to calculate area under curve.")
+        return pl.DataFrame()
+
+    def trapz_integral(series_struct):
+        y = series_struct.struct.field(element)
+        x = series_struct.struct.field('Radius(cm)')
+        sorted_indices = x.arg_sort()
+        return np.trapz(y.gather(sorted_indices).to_numpy(), x.gather(sorted_indices).to_numpy())
+
+    auc_aggs = []
+    for element in element_cols:
+        auc_aggs.append(
+            pl.struct([element, 'Radius(cm)'])
+            .apply(trapz_integral)
+            .alias(f"AUC_{element}")
+        )
+
+    grouped_data = data_df.group_by(time_column).agg(auc_aggs)
+
+    return grouped_data.melt(id_vars=[time_column]).pivot(
+        values="value", index="variable", columns=time_column
+    )
+
+
+def graphScurve_pl(file_path, df):
+    """Generates and saves a scatter plot for the S-Curve."""
+    if df.is_empty():
+        print("S-Curve DataFrame is empty, skipping graph generation.")
+        return
+    print("Generating S-Curve graph...")
+    fig = px.scatter(
+        df,
+        x='Mass flow rate(g/s)',
+        y='Tmax(K)',
+        hover_data=['FileName'],
+        template='plotly_dark',
+        title='S-Curve: Max Temperature vs. Mass Flow Rate'
+    )
+    output_path = os.path.join(file_path, 'a_scurve.html')
+    with open(output_path, 'w') as f:
+        f.write(pio.to_html(fig, full_html=False, auto_play=False))
+    print(f"S-Curve graph saved to {output_path}")
+
+
+def simGraph_pl(file_path, sm_df, data_df):
+    """Generates and saves summary and animated graphs."""
+    if sm_df.is_empty() or data_df.is_empty():
+        print("Input DataFrames are empty, skipping simulation graph generation.")
+        return
+
+    print("Generating simulation summary and animated graphs...")
+    y_cols = [c for c in sm_df.columns if 'max' in c.lower() and c != 'FileName']
+    fig1 = px.scatter(
+        sm_df,
+        x='Time(s)',
+        y=y_cols,
+        hover_data=['FileName'],
+        title='Sorted Maximums Over Time',
+        template='plotly_dark'
+    )
+
+    colKeepy = ['Temperature(K)', 'C2H4', 'O2', 'N2', 'H2O', 'CO2', 'CH', 'CHA', 'OH', 'OHA']
+    value_vars = [c for c in colKeepy if c in data_df.columns]
+    id_vars = [c for c in ['Radius(cm)', 'Time(s)', 'FileName'] if c in data_df.columns]
+
+    # Use unpivot, the modern replacement for melt, with updated arguments.
+    df_long = data_df.unpivot(
+        index=id_vars,
+        on=value_vars,
+        variable_name='Species',
+        value_name='Value'
+    )
+
+    fig2 = px.scatter(
+        df_long,
+        x='Radius(cm)',
+        y='Value',
+        color='Species',
+        animation_frame='Time(s)',
+        title='Animated Species Profile vs. Radius',
+        template='plotly_dark'
+    )
+
+    output_path = os.path.join(file_path, 'a_graph.html')
+    with open(output_path, 'w') as f:
+        f.write("<h1>Sorted Maximums Plot</h1>")
+        f.write(pio.to_html(fig1, full_html=False, auto_play=False))
+        f.write("<h1>Animated Species Plot</h1>")
+        f.write(pio.to_html(fig2, full_html=False, auto_play=False))
+    print(f"Simulation graphs saved to {output_path}")
+
+
+if __name__ == "__main__":
+    # Start the timer
+    start_time = time.monotonic()
+
+    # The directory where the 'DATA*' files are located.
+    # IMPORTANT: Update this path to your specific directory.
+    target_dir = "/Users/ryanmattana/Desktop/SPAM/sample data"
+    print(f'Directory Input: {target_dir}')
+
+    # --- Main processing ---
+    dataDf_pl, sortmax_pl = simParse_pl(target_dir)
+
+    # --- Save results ---
+    if not dataDf_pl.is_empty() and not sortmax_pl.is_empty():
+        data_pickle_path = os.path.join(target_dir, 'dataDf.pkl')
+        sortmax_pickle_path = os.path.join(target_dir, 'sortmax.pkl')
+
+        # Convert to pandas DataFrame before saving to pickle, as Polars lacks a direct method.
+        # This requires pandas to be installed (`pip install pandas`).
+        print(f"Saving data to {data_pickle_path}")
+        dataDf_pl.to_pandas().to_pickle(data_pickle_path)
+
+        print(f"Saving summary data to {sortmax_pickle_path}")
+        sortmax_pl.to_pandas().to_pickle(sortmax_pickle_path)
+
+        # --- Generate visualizations ---
+        graphScurve_pl(target_dir, sortmax_pl)
+        simGraph_pl(target_dir, sortmax_pl, dataDf_pl)
+
+    else:
+        print("Processing finished with no data. Exiting.")
+
+    # Stop the timer and print the elapsed time
+    end_time = time.monotonic()
+    duration = end_time - start_time
+    print(f"\nTotal execution time: {duration:.3f} seconds")
+
