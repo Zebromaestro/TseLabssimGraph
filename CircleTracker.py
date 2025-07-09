@@ -153,6 +153,50 @@ with open(csv_file_path, 'w', newline='') as f:
     writer.writerows(coordinate_data)
 print(f"Coordinate data saved as {csv_file_path}")
 
+# --- NEW: Calculate Statistics ---
+stats = {}
+if radial_velocity_data:
+    stats['Radial Velocity'] = {
+        'mean': np.mean(radial_velocity_data),
+        'median': np.median(radial_velocity_data),
+        'std_dev': np.std(radial_velocity_data)
+    }
+if tangential_velocity_data:
+    stats['Tangential Velocity'] = {
+        'mean': np.mean(tangential_velocity_data),
+        'median': np.median(tangential_velocity_data),
+        'std_dev': np.std(tangential_velocity_data)
+    }
+if angular_velocity_data:
+    stats['Angular Velocity'] = {
+        'mean': np.mean(angular_velocity_data),
+        'median': np.median(angular_velocity_data),
+        'std_dev': np.std(angular_velocity_data)
+    }
+
+# --- NEW: Create HTML for Statistics Table ---
+stats_html = """
+<h2 style='font-family: sans-serif;'>Statistical Summary</h2>
+<table style='font-family: sans-serif; border-collapse: collapse; width: 50%;'>
+  <tr style='background-color: #f2f2f2;'>
+    <th style='border: 1px solid #ddd; padding: 8px;'>Metric</th>
+    <th style='border: 1px solid #ddd; padding: 8px;'>Mean</th>
+    <th style='border: 1px solid #ddd; padding: 8px;'>Median</th>
+    <th style='border: 1px solid #ddd; padding: 8px;'>Standard Deviation</th>
+  </tr>
+"""
+for metric, values in stats.items():
+    stats_html += f"""
+  <tr>
+    <td style='border: 1px solid #ddd; padding: 8px;'><b>{metric}</b></td>
+    <td style='border: 1px solid #ddd; padding: 8px;'>{values['mean']:.3f}</td>
+    <td style='border: 1px solid #ddd; padding: 8px;'>{values['median']:.3f}</td>
+    <td style='border: 1px solid #ddd; padding: 8px;'>{values['std_dev']:.3f}</td>
+  </tr>
+"""
+stats_html += "</table>"
+
+
 # 2. Create interactive velocity plots with Plotly
 print("Generating interactive velocity plots...")
 fig_vel = make_subplots(rows=3, cols=1, shared_xaxes=True,
@@ -186,7 +230,7 @@ fig_vel.update_yaxes(title_text="pixels/s", row=1, col=1)
 fig_vel.update_yaxes(title_text="pixels/s", row=2, col=1)
 fig_vel.update_yaxes(title_text="rad/s", row=3, col=1)
 
-# --- NEW: Create custom X-axis labels with both Time and Frames ---
+# Create custom X-axis labels with both Time and Frames
 if time_data:
     # Select ~10 tick values evenly spaced through the data
     num_ticks = 10
@@ -237,12 +281,17 @@ with open(html_file_path, 'w') as f:
     f.write("<html><head><title>Interactive Plots</title></head><body>\n")
     f.write("<h1 style='font-family: sans-serif; text-align: center;'>Tracking Analysis</h1>\n")
 
+    # --- NEW: Add the statistics table to the HTML file ---
+    if stats:
+        f.write(stats_html)
+        f.write("<hr>") # Add a horizontal line for separation
+
     f.write("<h2 style='font-family: sans-serif;'>Velocity Plots</h2>\n")
     f.write("<p style='font-family: sans-serif;'>Click and drag to zoom, double-click to reset. Hover over points for details.</p>\n")
     plot_html = fig_vel.to_html(full_html=False, include_plotlyjs='cdn')
     f.write(plot_html)
 
-    if trail_points:
+    if 'fig_trail' in locals():
         f.write("<hr><h2 style='font-family: sans-serif;'>Trail Path Plot</h2>\n")
         f.write("<p style='font-family: sans-serif;'>This plot shows the detected path of the light source.</p>\n")
         plot_html = fig_trail.to_html(full_html=False, include_plotlyjs='cdn')
@@ -250,4 +299,4 @@ with open(html_file_path, 'w') as f:
 
     f.write("</body></html>\n")
 
-print(f"Successfully created {html_file_path}. Open this file in a web browser to view the interactive plots.")
+print(f"Successfully created {html_file_path}. Open this file in a web browser to view the interactive plots and statistics.")
