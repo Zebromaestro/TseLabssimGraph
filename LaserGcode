@@ -64,12 +64,18 @@
         .grid-group, .preset-group { display: flex; gap: 10px; }
         .grid-group > div { flex: 1; }
 
-        input[type="number"], input[type="text"], input[type="file"], select {
+        input[type="number"], input[type="text"], input[type="file"], select, textarea {
             width: 100%;
             padding: 8px;
             border: 1px solid #ccc;
             border-radius: 4px;
             box-sizing: border-box;
+        }
+
+        .param-group textarea {
+            font-family: "Courier New", Courier, monospace;
+            font-size: 14px;
+            resize: vertical;
         }
 
         .checkbox-label {
@@ -95,12 +101,14 @@
         /* --- Cell Center Controls --- */
         #cell-centers-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }
         .cell-control-group { background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 5px; padding: 10px; }
-        .cell-control-group .coord-group { display: flex; gap: 5px; margin-bottom: 10px; }
+        .cell-control-group .coord-group { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; }
+        .cell-control-group .coord-group input { flex: 1; }
+        .cell-diameter-label { font-weight: 600; }
         .cell-label { display: flex; justify-content: space-between; align-items: center; }
         .cell-speed-group { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; align-items: center; margin-bottom: 10px; }
         .cell-speed-group label { font-size: 0.9em; font-weight: normal; margin-bottom: 0; }
         .cell-speed-group input { padding: 4px; }
-        .radius-display { font-size: 0.9em; color: #6c757d; }
+        .diameter-display { font-size: 0.9em; color: #6c757d; font-weight: bold; margin-top: 5px; }
 
         /* --- Buttons --- */
         .btn {
@@ -108,6 +116,13 @@
             border: none; border-radius: 5px; cursor: pointer;
             transition: background-color 0.2s;
             margin-top: 10px;
+        }
+        #apply-btn {
+            background-color: #198754;
+            margin-bottom: 25px;
+        }
+        #apply-btn:hover {
+            background-color: #157347;
         }
         .btn-group { display: flex; gap: 10px; }
 
@@ -144,6 +159,8 @@
 
     <div class="container">
         <div class="controls">
+            <button id="apply-btn" class="btn">🚀 Apply Changes & Generate</button>
+
             <h2>Global Settings</h2>
             <div class="param-group">
                 <label for="grid-size">Total Bed Size (mm)</label>
@@ -172,8 +189,8 @@
 
             <h3>Spiral Parameters</h3>
             <div class="param-group">
-                <label for="num-rotations">Spiral Rotations</label>
-                <input type="number" id="num-rotations" value="10">
+                <label for="num-rotations">Max Spiral Rotations</label>
+                <input type="number" id="num-rotations" value="20">
             </div>
             <div class="param-group">
                 <label for="spiral-tightness">Spiral Tightness (mm/rad)</label>
@@ -182,6 +199,16 @@
             <div class="param-group">
                 <label for="step-length">Spiral Step Length (mm)</label>
                 <input type="number" id="step-length" value="4">
+            </div>
+
+            <h3>Custom G-code Scripts</h3>
+            <div class="param-group">
+                <label for="start-gcode">Start G-code (Placeholders: {Z_HEIGHT}, {TRAVEL_FEEDRATE})</label>
+                <textarea id="start-gcode" rows="6"></textarea>
+            </div>
+            <div class="param-group">
+                <label for="end-gcode">End G-code (Placeholder: {TRAVEL_FEEDRATE})</label>
+                <textarea id="end-gcode" rows="3"></textarea>
             </div>
 
             <h3>G-code File Order (Drag to Reorder)</h3>
@@ -262,6 +289,7 @@
         // --- GLOBAL STATE & DOM ---
         let backgroundImage = new Image();
         const dom = {
+            applyBtn: document.getElementById('apply-btn'),
             inputs: {
                 gridSize: document.getElementById('grid-size'),
                 travelSpeed: document.getElementById('travel-speed'),
@@ -270,9 +298,12 @@
                 numRotations: document.getElementById('num-rotations'),
                 spiralTightness: document.getElementById('spiral-tightness'),
                 stepLength: document.getElementById('step-length'),
+                startGcode: document.getElementById('start-gcode'),
+                endGcode: document.getElementById('end-gcode'),
                 gridRows: document.getElementById('grid-rows'),
                 gridCols: document.getElementById('grid-cols'),
                 showGrid: document.getElementById('show-grid'),
+                presetName: document.getElementById('preset-name'),
             },
             shapeOrderList: document.getElementById('shape-order-list'),
             cellCentersContainer: document.getElementById('cell-centers-container'),
@@ -280,7 +311,6 @@
             canvas: document.getElementById('preview-canvas'),
             ctx: document.getElementById('preview-canvas').getContext('2d'),
             presets: {
-                name: document.getElementById('preset-name'),
                 saveBtn: document.getElementById('preset-save-btn'),
                 select: document.getElementById('preset-select'),
                 loadBtn: document.getElementById('preset-load-btn'),
@@ -296,7 +326,14 @@
             };
             for (const key in dom.inputs) {
                 const el = dom.inputs[key];
-                config[key] = (el.type === 'checkbox') ? el.checked : parseFloat(el.value);
+                const type = el.type;
+                if (type === 'checkbox') {
+                    config[key] = el.checked;
+                } else if (type === 'textarea' || type === 'text') {
+                    config[key] = el.value;
+                } else {
+                    config[key] = parseFloat(el.value);
+                }
             }
 
             const shapeLiElements = dom.shapeOrderList.querySelectorAll('li');
@@ -314,6 +351,7 @@
                 config.cellControls.push({
                     x: parseFloat(group.querySelector('.cell-center-x').value),
                     y: parseFloat(group.querySelector('.cell-center-y').value),
+                    diameter: parseFloat(group.querySelector('.cell-diameter').value),
                     enabled: group.querySelector('.cell-enabled').checked,
                     speeds: {
                         spiral: parseFloat(group.querySelector('.cell-spiral-speed').value),
@@ -328,9 +366,11 @@
         function applyConfig(config) {
             for (const key in dom.inputs) {
                  const el = dom.inputs[key];
+                 if (!el || config[key] === undefined) continue;
+
                  if (el.type === 'checkbox') {
                      el.checked = config[key];
-                 } else if (el) { // Ensure element exists before setting value
+                 } else { // covers textarea, text, number
                      el.value = config[key];
                  }
             }
@@ -343,6 +383,7 @@
                 if (cellConfig) {
                     group.querySelector('.cell-center-x').value = cellConfig.x;
                     group.querySelector('.cell-center-y').value = cellConfig.y;
+                    group.querySelector('.cell-diameter').value = cellConfig.diameter;
                     group.querySelector('.cell-enabled').checked = cellConfig.enabled;
                     group.querySelector('.cell-spiral-speed').value = cellConfig.speeds.spiral;
                     group.querySelector('.cell-circle-speed').value = cellConfig.speeds.circle;
@@ -366,20 +407,21 @@
             const config = collectConfig();
 
             const augmentedData = config.cellControls.map(cell => {
+                if (!cell.enabled) return null;
+                const targetRadius = cell.diameter / 2;
                 const center = { x: cell.x, y: cell.y };
-                const spiralPoints = generateSpiralPoints(config, center);
-                const maxRadius = calculateMaxRadius(spiralPoints, center);
+                const spiralPoints = generateSpiralPoints(config, center, targetRadius);
                 return {
+                    center,
                     spiralPoints,
-                    maxRadius,
-                    squareVertices: calculateSquareVertices(maxRadius, center)
+                    targetRadius,
+                    squareVertices: calculateSquareVertices(targetRadius, center)
                 };
-            });
+            }).filter(Boolean);
 
-            updateRadiusDisplays(augmentedData);
-
+            updateDiameterDisplays(augmentedData);
             const gcodeFiles = generateGCodeFiles(config, augmentedData);
-            renderGCodeOutputs(gcodeFiles, config);
+            renderGCodeOutputs(gcodeFiles);
             drawPreview(config, augmentedData);
         }
 
@@ -395,21 +437,29 @@
                 const travelSpeedMin = config.travelSpeed * 60;
                 const servoDelay = `G4 P${config.servoDelay} ; Wait before/after servo move\n`;
 
-                gcode += `; G-code for ${shapeInfo.name.toUpperCase()}S\n`;
-                gcode += `; Generated using ABSOLUTE positioning (G90)\n`;
-                gcode += `; Klipper Arc (I,J) compatible\n`;
-                gcode += `; ========================================\n`;
-                gcode += `G90\nM140 S0\nM104 S0\nG28\nG0 Z${f4(config.zHeight)} F${travelSpeedMin}\n`;
+                const startScript = (config.startGcode || '')
+                    .replace(/{Z_HEIGHT}/g, f4(config.zHeight))
+                    .replace(/{TRAVEL_FEEDRATE}/g, travelSpeedMin.toFixed(0));
 
+                const endScript = (config.endGcode || '')
+                    .replace(/{TRAVEL_FEEDRATE}/g, travelSpeedMin.toFixed(0));
+
+                gcode += `; G-code for ${shapeInfo.name.toUpperCase()}S\n`;
+                gcode += `; Generated on ${new Date().toLocaleString()}\n`;
+                gcode += `; ========================================\n`;
+                gcode += startScript + '\n';
+
+                let dataIndex = 0;
                 config.cellControls.forEach((cell, index) => {
                     if (!cell.enabled) return;
 
-                    const center = { x: cell.x, y: cell.y };
+                    const data = augmentedData[dataIndex++];
+                    if (!data) return;
+
                     const speedMms = cell.speeds[shapeInfo.name];
                     const speedMmm = speedMms * 60;
-                    const data = augmentedData[index];
 
-                    gcode += `\n; --- Cell ${index + 1} ${shapeInfo.name} ---\n`;
+                    gcode += `\n; --- Cell ${index + 1} (${cell.x}, ${cell.y}) ${shapeInfo.name} ---\n`;
 
                     switch (shapeInfo.name) {
                         case 'square': {
@@ -428,14 +478,13 @@
                             break;
                         }
                         case 'circle': {
-                            const maxRadius = data.maxRadius;
-                            const startX = center.x + maxRadius;
-                            const startY = center.y;
+                            const startX = data.center.x + data.targetRadius;
+                            const startY = data.center.y;
                             gcode += `G0 X${f4(startX)} Y${f4(startY)} F${travelSpeedMin}\n`;
                             gcode += servoDelay;
                             gcode += `${LASER_OPEN}\n`;
                             gcode += servoDelay;
-                            gcode += `G2 X${f4(startX)} Y${f4(startY)} I${f4(-maxRadius)} J0 F${speedMmm}\n`;
+                            gcode += `G2 X${f4(startX)} Y${f4(startY)} I${f4(-data.targetRadius)} J0 F${speedMmm}\n`;
                             gcode += servoDelay;
                             gcode += `${LASER_CLOSE}\n`;
                             gcode += servoDelay;
@@ -454,10 +503,9 @@
                             for (let i = 2; i < points.x.length; i++) {
                                 const startPointAbs = { x: points.x[i - 1], y: points.y[i - 1] };
                                 const endPointAbs = { x: points.x[i], y: points.y[i] };
-                                const arcCenterAbs = { x: center.x, y: center.y };
 
-                                const iOffset = arcCenterAbs.x - startPointAbs.x;
-                                const jOffset = arcCenterAbs.y - startPointAbs.y;
+                                const iOffset = data.center.x - startPointAbs.x;
+                                const jOffset = data.center.y - startPointAbs.y;
 
                                 gcode += `G3 X${f4(endPointAbs.x)} Y${f4(endPointAbs.y)} I${f4(iOffset)} J${f4(jOffset)} F${speedMmm}\n`;
                             }
@@ -469,8 +517,8 @@
                     }
                 });
 
-                gcode += `\n; --- End of paths ---\n`;
-                gcode += `G90\nG0 Z350 F${travelSpeedMin}\n`;
+                gcode += `\n; --- End of Job ---\n`;
+                gcode += endScript + '\n';
 
                 files.push({
                     title: `File for ${shapeInfo.name.charAt(0).toUpperCase() + shapeInfo.name.slice(1)}s`,
@@ -483,36 +531,32 @@
         }
 
         // --- POINT CALCULATION HELPERS ---
-        function generateSpiralPoints(p, center) {
+        function generateSpiralPoints(p, center, targetRadius) {
             const xPoints = [], yPoints = [];
-            const totalAngle = p.numRotations * 2 * Math.PI;
+            const totalAngle = p.numRotations * 2 * Math.PI; // This is now a maximum limit
             xPoints.push(center.x); yPoints.push(center.y);
 
             let theta = 0.001;
             while (theta < totalAngle) {
                 const rSpiral = p.spiralTightness * theta;
+                if (rSpiral > targetRadius) break; // Stop if we exceed the target radius
+
                 const xShifted = (rSpiral * Math.cos(theta)) + center.x;
                 const yShifted = (rSpiral * Math.sin(theta)) + center.y;
                 xPoints.push(xShifted); yPoints.push(yShifted);
+
                 const dTheta = p.stepLength / (p.spiralTightness * Math.sqrt(1 + theta ** 2));
                 theta += dTheta;
             }
             return { x: xPoints, y: yPoints };
         }
 
-        function calculateMaxRadius(spiralPoints, center) {
-            if (spiralPoints.x.length < 2) return 0;
-            const lastX = spiralPoints.x[spiralPoints.x.length - 1];
-            const lastY = spiralPoints.y[spiralPoints.y.length - 1];
-            return Math.sqrt((lastX - center.x)**2 + (lastY - center.y)**2);
-        }
-
-        function calculateSquareVertices(maxRadius, center) {
+        function calculateSquareVertices(radius, center) {
             return {
-                bl: { x: center.x - maxRadius, y: center.y - maxRadius },
-                br: { x: center.x + maxRadius, y: center.y - maxRadius },
-                tr: { x: center.x + maxRadius, y: center.y + maxRadius },
-                tl: { x: center.x - maxRadius, y: center.y + maxRadius },
+                bl: { x: center.x - radius, y: center.y - radius },
+                br: { x: center.x + radius, y: center.y - radius },
+                tr: { x: center.x + radius, y: center.y + radius },
+                tl: { x: center.x - radius, y: center.y + radius },
             };
         }
 
@@ -585,10 +629,12 @@
             const scale = canvas.width / config.gridSize;
             const transform = (x, y) => ({ x: x * scale, y: canvas.height - (y * scale) });
 
-            config.cellControls.forEach((cell, index) => {
+            let dataIndex = 0;
+            config.cellControls.forEach((cell) => {
                 if (!cell.enabled) return;
 
-                const data = augmentedData[index];
+                const data = augmentedData[dataIndex++];
+                if (!data) return;
 
                 config.shapes.forEach(shape => {
                     if (!shape.enabled) return;
@@ -609,8 +655,8 @@
                             }
                             break;
                         case 'circle':
-                            const canvasCenter = transform(cell.x, cell.y);
-                            ctx.arc(canvasCenter.x, canvasCenter.y, data.maxRadius * scale, 0, 2 * Math.PI);
+                            const canvasCenter = transform(data.center.x, data.center.y);
+                            ctx.arc(canvasCenter.x, canvasCenter.y, data.targetRadius * scale, 0, 2 * Math.PI);
                             break;
                         case 'square':
                             const v = data.squareVertices;
@@ -630,7 +676,7 @@
         function renderGCodeOutputs(files) {
             dom.gcodeOutputsContainer.innerHTML = '';
             if (files.length === 0) {
-                 dom.gcodeOutputsContainer.innerHTML = '<p>No G-code files to generate. Enable a shape type to begin.</p>';
+                 dom.gcodeOutputsContainer.innerHTML = '<p>No G-code files to generate. Enable a shape type and click "Apply" to begin.</p>';
                  return;
             }
             files.forEach((file) => {
@@ -683,14 +729,26 @@
             });
         }
 
-        function updateRadiusDisplays(augmentedData) {
+        function updateDiameterDisplays(augmentedData) {
             const cellGroups = dom.cellCentersContainer.querySelectorAll('.cell-control-group');
-            cellGroups.forEach((group, index) => {
-                const radiusDisplay = group.querySelector('.radius-display');
-                if (radiusDisplay) {
-                    const data = augmentedData[index];
-                    radiusDisplay.textContent = `Max Radius: ${data.maxRadius.toFixed(2)} mm`;
-                }
+            let dataIndex = 0;
+            cellGroups.forEach((group) => {
+                 const display = group.querySelector('.diameter-display');
+                 const isEnabled = group.querySelector('.cell-enabled').checked;
+
+                 if (display && isEnabled) {
+                    const data = augmentedData[dataIndex++];
+                    if (data && data.spiralPoints.x.length > 1) {
+                         const lastX = data.spiralPoints.x.slice(-1)[0];
+                         const lastY = data.spiralPoints.y.slice(-1)[0];
+                         const finalRadius = Math.sqrt((lastX - data.center.x)**2 + (lastY - data.center.y)**2);
+                         display.textContent = `Final Diameter: ${(finalRadius * 2).toFixed(2)} mm`;
+                    } else if (data) {
+                         display.textContent = `Final Diameter: 0.00 mm`;
+                    }
+                 } else if (display) {
+                    display.textContent = 'Final Diameter: 0.00 mm';
+                 }
             });
         }
 
@@ -720,22 +778,23 @@
                            <input type="number" class="cell-center-x" value="${defaultCenterX.toFixed(2)}" title="Center X (mm)">
                            <input type="number" class="cell-center-y" value="${defaultCenterY.toFixed(2)}" title="Center Y (mm)">
                         </div>
-                        <div class="cell-speed-group">
-                            <label for="cell-spiral-speed-${r}-${c}">🌀 Speed (mm/s):</label>
-                            <input type="number" class="cell-spiral-speed" id="cell-spiral-speed-${r}-${c}" value="80" title="Spiral Speed (mm/s)">
-                            <label for="cell-circle-speed-${r}-${c}">⭕ Speed (mm/s):</label>
-                            <input type="number" class="cell-circle-speed" id="cell-circle-speed-${r}-${c}" value="100" title="Circle Speed (mm/s)">
-                            <label for="cell-square-speed-${r}-${c}">🔲 Speed (mm/s):</label>
-                            <input type="number" class="cell-square-speed" id="cell-square-speed-${r}-${c}" value="70" title="Square Speed (mm/s)">
+                        <div class="coord-group">
+                           <label class="cell-diameter-label">Diameter:</label>
+                           <input type="number" class="cell-diameter" value="50" title="Target Diameter (mm)">
                         </div>
-                        <div class="radius-display">Max Radius: 0.00 mm</div>
+                        <div class="cell-speed-group">
+                            <label>🌀 Speed (mm/s):</label>
+                            <input type="number" class="cell-spiral-speed" value="80">
+                            <label>⭕ Speed (mm/s):</label>
+                            <input type="number" class="cell-circle-speed" value="100">
+                            <label>🔲 Speed (mm/s):</label>
+                            <input type="number" class="cell-square-speed" value="70">
+                        </div>
+                        <div class="diameter-display">Final Diameter: 0.00 mm</div>
                     `;
                     dom.cellCentersContainer.appendChild(group);
                 }
             }
-            dom.cellCentersContainer.querySelectorAll('input').forEach(input => {
-                input.addEventListener('input', generate);
-            });
         }
 
         // --- PRESET MANAGEMENT ---
@@ -762,17 +821,14 @@
         }
 
         // --- EVENT LISTENERS ---
-        Object.values(dom.inputs).forEach(input => {
-            if (input) input.addEventListener('input', generate);
-        });
-        dom.shapeOrderList.querySelectorAll('input').forEach(input => input.addEventListener('input', generate));
-        dom.inputs.gridRows.addEventListener('input', () => { updateCellCenterInputs(); generate(); });
-        dom.inputs.gridCols.addEventListener('input', () => { updateCellCenterInputs(); generate(); });
-        dom.inputs.gridSize.addEventListener('input', () => { updateCellCenterInputs(); generate(); });
-        dom.shapeOrderList.addEventListener('drop', generate);
+        dom.applyBtn.addEventListener('click', generate);
+
+        dom.inputs.gridRows.addEventListener('input', updateCellCenterInputs);
+        dom.inputs.gridCols.addEventListener('input', updateCellCenterInputs);
+        dom.inputs.gridSize.addEventListener('input', updateCellCenterInputs);
 
         dom.presets.saveBtn.addEventListener('click', () => {
-            const name = dom.presets.name.value.trim();
+            const name = dom.inputs.presetName.value.trim();
             if (!name) {
                 alert('Please enter a name for the preset.');
                 return;
@@ -794,7 +850,6 @@
             const config = presets[name];
             if (config) {
                 applyConfig(config);
-                dom.presets.name.value = name;
                 alert(`Preset "${name}" loaded!`);
             }
         });
@@ -837,6 +892,9 @@
 
         // --- INITIALIZATION ---
         document.addEventListener('DOMContentLoaded', () => {
+            dom.inputs.startGcode.value = `G90\nM140 S0\nM104 S0\nG28\nG0 Z{Z_HEIGHT} F{TRAVEL_FEEDRATE}`;
+            dom.inputs.endGcode.value = `G90\nG0 Z350 F{TRAVEL_FEEDRATE}`;
+
             backgroundImage.src = 'REALgridfinitydesign.JPG';
             backgroundImage.onload = () => generate();
             backgroundImage.onerror = () => {
