@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Advanced G-Code Generator</title>
+    <title>Advanced G-Code Generator with Distance Analysis</title>
     <style>
         /* --- General Body & Layout --- */
         body {
@@ -49,6 +49,12 @@
         }
         h1 { text-align: center; margin-bottom: 20px; }
         h3 { font-size: 1.1em; border-bottom-width: 1px; margin-top: 20px; }
+        h4 {
+            margin-top: 0;
+            margin-bottom: 5px;
+            color: #343a40;
+            border-bottom: none;
+        }
 
         /* --- Input Controls --- */
         .param-group, .grid-group, .preview-group {
@@ -150,6 +156,80 @@
              background: #fff; padding: 20px; border-radius: 8px;
              box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
+
+        /* --- Distance Analysis Table Styles --- */
+        #distance-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 15px;
+            table-layout: fixed;
+        }
+        #distance-table th, #distance-table td {
+            padding: 10px 12px;
+            text-align: left;
+            border-bottom: 1px solid #dee2e6;
+            word-wrap: break-word;
+        }
+        #distance-table th {
+            background-color: #e9ecef;
+            font-weight: 600;
+        }
+        #distance-table tbody tr:hover {
+            background-color: #f8f9fa;
+        }
+        #distance-table tfoot td {
+            font-weight: bold;
+            border-top: 2px solid #0d6efd;
+            color: #198754;
+        }
+       .assumptions {
+            font-size: 0.9em;
+            color: #6c757d;
+            background-color: #f8f9fa;
+            padding: 10px 15px;
+            border-radius: 4px;
+            border: 1px solid #dee2e6;
+            margin-top: 10px;
+        }
+        .assumptions ul {
+            padding-left: 20px;
+            margin-bottom: 0;
+            margin-top: 5px;
+        }
+
+        /* --- Overlap Analysis Styles --- */
+        .analysis-calculator {
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 5px;
+        }
+        .result-display {
+            margin-top: 10px;
+            padding: 12px;
+            border-radius: 4px;
+            font-size: 1.05em;
+            font-weight: 500;
+            border-left: 5px solid;
+            transition: background-color 0.3s, border-color 0.3s;
+        }
+        .result-display.safe {
+            background-color: #e6f9f0;
+            border-color: #198754;
+            color: #146c43;
+        }
+        .result-display.warning {
+            background-color: #fff8e6;
+            border-color: #ffc107;
+            color: #997404;
+        }
+        .result-display p {
+            margin: 0;
+            padding: 0;
+        }
+        .result-display p:first-child {
+            margin-bottom: 8px;
+        }
+
 
     </style>
 </head>
@@ -263,6 +343,25 @@
         </div>
 
         <div class="output">
+            <div class="output-group" id="distance-summary-container">
+                <h2>Distance & Time Analysis ⏱️</h2>
+                <div id="distance-summary">
+                    <p>Click "Apply Changes & Generate" to calculate drawing distances and times.</p>
+                </div>
+            </div>
+
+            <div class="output-group" id="overlap-analysis-container">
+                <h2>Spiral Overlap Analysis 🔬</h2>
+                <div class="analysis-calculator">
+                    <div class="param-group">
+                        <label for="laser-width">Laser Beam Width (mm)</label>
+                        <input type="number" id="laser-width" value="0.4" step="0.05">
+                    </div>
+                    <div id="overlap-analysis-result" class="result-display">
+                        </div>
+                </div>
+            </div>
+
             <div class="output-group">
                 <h2>Preview</h2>
                 <canvas id="preview-canvas" width="1000" height="1000"></canvas>
@@ -304,10 +403,13 @@
                 gridCols: document.getElementById('grid-cols'),
                 showGrid: document.getElementById('show-grid'),
                 presetName: document.getElementById('preset-name'),
+                laserWidth: document.getElementById('laser-width'),
             },
             shapeOrderList: document.getElementById('shape-order-list'),
             cellCentersContainer: document.getElementById('cell-centers-container'),
             gcodeOutputsContainer: document.getElementById('gcode-outputs-container'),
+            distanceSummary: document.getElementById('distance-summary'),
+            overlapAnalysisResult: document.getElementById('overlap-analysis-result'),
             canvas: document.getElementById('preview-canvas'),
             ctx: document.getElementById('preview-canvas').getContext('2d'),
             presets: {
@@ -405,6 +507,7 @@
 
         function generate() {
             const config = collectConfig();
+            const presetName = dom.inputs.presetName.value.trim();
 
             const augmentedData = config.cellControls.map(cell => {
                 if (!cell.enabled) return null;
@@ -419,16 +522,169 @@
                 };
             }).filter(Boolean);
 
+            const analysis = calculateDistances(config, augmentedData);
+            renderAnalysisTable(analysis);
+            updateOverlapAnalysis();
+
             updateDiameterDisplays(augmentedData);
-            const gcodeFiles = generateGCodeFiles(config, augmentedData);
+            const gcodeFiles = generateGCodeFiles(config, augmentedData, presetName);
             renderGCodeOutputs(gcodeFiles);
             drawPreview(config, augmentedData);
         }
 
+        // --- DISTANCE & TIME CALCULATION LOGIC ---
+        function calculateDistances(config, augmentedData) {
+            const analysis = {
+                square: { distance_mm: 0, time_s: 0 },
+                circle: { distance_mm: 0, time_s: 0 },
+                spiral: { distance_mm: 0, time_s: 0 },
+                total:  { distance_mm: 0, time_s: 0 }
+            };
+
+            const enabledShapes = config.shapes.filter(s => s.enabled).map(s => s.name);
+
+            let dataIndex = 0;
+            config.cellControls.forEach((cell) => {
+                if (!cell.enabled) return;
+                const data = augmentedData[dataIndex++];
+                if (!data) return;
+
+                // --- Square ---
+                if (enabledShapes.includes('square')) {
+                    const dist = 8 * data.targetRadius; // Perimeter
+                    const speed = cell.speeds.square;
+                    analysis.square.distance_mm += dist;
+                    if (speed > 0) {
+                        analysis.square.time_s += dist / speed;
+                    }
+                }
+
+                // --- Circle ---
+                if (enabledShapes.includes('circle')) {
+                    const dist = 2 * Math.PI * data.targetRadius; // Circumference
+                    const speed = cell.speeds.circle;
+                    analysis.circle.distance_mm += dist;
+                    if (speed > 0) {
+                        analysis.circle.time_s += dist / speed;
+                    }
+                }
+
+                // --- Spiral ---
+                if (enabledShapes.includes('spiral')) {
+                    const points = data.spiralPoints;
+                    let spiralLength = 0;
+                    for (let i = 1; i < points.x.length; i++) {
+                        const dx = points.x[i] - points.x[i-1];
+                        const dy = points.y[i] - points.y[i-1];
+                        spiralLength += Math.sqrt(dx*dx + dy*dy);
+                    }
+                    const speed = cell.speeds.spiral;
+                    analysis.spiral.distance_mm += spiralLength;
+                    if (speed > 0) {
+                        analysis.spiral.time_s += spiralLength / speed;
+                    }
+                }
+            });
+
+            // Calculate Totals
+            analysis.total.distance_mm = analysis.square.distance_mm + analysis.circle.distance_mm + analysis.spiral.distance_mm;
+            analysis.total.time_s = analysis.square.time_s + analysis.circle.time_s + analysis.spiral.time_s;
+
+            return analysis;
+        }
+
+        // --- ANALYSIS TABLE RENDERER ---
+        function renderAnalysisTable(analysis) {
+            if (!dom.distanceSummary) return;
+
+            const f2 = (n) => n.toFixed(2);
+
+            dom.distanceSummary.innerHTML = `
+                <table id="distance-table">
+                    <thead>
+                        <tr>
+                            <th>Shape</th>
+                            <th>Dist (mm)</th>
+                            <th>Dist (cm)</th>
+                            <th>Time (s)</th>
+                            <th>Time (min)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>🔲 Square</td>
+                            <td>${f2(analysis.square.distance_mm)}</td>
+                            <td>${f2(analysis.square.distance_mm / 10)}</td>
+                            <td>${f2(analysis.square.time_s)}</td>
+                            <td>${f2(analysis.square.time_s / 60)}</td>
+                        </tr>
+                        <tr>
+                            <td>⭕ Circle</td>
+                            <td>${f2(analysis.circle.distance_mm)}</td>
+                            <td>${f2(analysis.circle.distance_mm / 10)}</td>
+                            <td>${f2(analysis.circle.time_s)}</td>
+                            <td>${f2(analysis.circle.time_s / 60)}</td>
+                        </tr>
+                        <tr>
+                            <td>🌀 Spiral</td>
+                            <td>${f2(analysis.spiral.distance_mm)}</td>
+                            <td>${f2(analysis.spiral.distance_mm / 10)}</td>
+                            <td>${f2(analysis.spiral.time_s)}</td>
+                            <td>${f2(analysis.spiral.time_s / 60)}</td>
+                        </tr>
+                    </tbody>
+                    <tfoot>
+                        <tr>
+                            <td>Total</td>
+                            <td>${f2(analysis.total.distance_mm)}</td>
+                            <td>${f2(analysis.total.distance_mm / 10)}</td>
+                            <td>${f2(analysis.total.time_s)}</td>
+                            <td>${f2(analysis.total.time_s / 60)}</td>
+                        </tr>
+                    </tfoot>
+                </table>
+                <div class="assumptions">
+                    <h4>Calculation Assumptions:</h4>
+                    <ul>
+                        <li><strong>Constant Speed:</strong> Time is calculated using the formula $ \\text{Time} = \\text{Distance} / \\text{Speed} $. It assumes the machine instantly reaches the set speed for each segment.</li>
+                        <li><strong>Negligible Acceleration:</strong> The time taken for acceleration and deceleration at path starts, ends, and corners is not included.</li>
+                        <li><strong>Drawing Time Only:</strong> The analysis only includes time for drawing movements (laser on). It does not account for rapid travel time between drawing areas or the specified servo delays.</li>
+                    </ul>
+                </div>
+            `;
+        }
+
+        // --- OVERLAP ANALYSIS ---
+        function updateOverlapAnalysis() {
+            const beamWidth = parseFloat(dom.inputs.laserWidth.value);
+            const currentTightness = parseFloat(dom.inputs.spiralTightness.value);
+
+            if (isNaN(beamWidth) || beamWidth <= 0) {
+                dom.overlapAnalysisResult.innerHTML = `<p>Please enter a valid, positive beam width.</p>`;
+                dom.overlapAnalysisResult.className = 'result-display';
+                return;
+            }
+
+            const minTightness = beamWidth / (2 * Math.PI);
+
+            let messageHTML = `<p>To avoid overlap, 'Spiral Tightness' must be at least <strong>${minTightness.toFixed(4)} mm/rad</strong>.</p>`;
+
+            if (currentTightness >= minTightness) {
+                dom.overlapAnalysisResult.className = 'result-display safe';
+                messageHTML += `<p>✅ Your current setting of ${currentTightness} mm/rad is sufficient.</p>`;
+            } else {
+                dom.overlapAnalysisResult.className = 'result-display warning';
+                messageHTML += `<p>⚠️ Your current setting of ${currentTightness} mm/rad is too low and may cause overlap.</p>`;
+            }
+            dom.overlapAnalysisResult.innerHTML = messageHTML;
+        }
+
+
         // --- G-CODE GENERATION ---
-        function generateGCodeFiles(config, augmentedData) {
+        function generateGCodeFiles(config, augmentedData, presetName) {
             const files = [];
             const f4 = (n) => n.toFixed(4);
+            const baseFilename = presetName ? presetName.replace(/[\s/\\?%*:|"<>]/g, '_') : 'unnamed_preset';
 
             config.shapes.forEach(shapeInfo => {
                 if (!shapeInfo.enabled) return;
@@ -522,7 +778,7 @@
 
                 files.push({
                     title: `File for ${shapeInfo.name.charAt(0).toUpperCase() + shapeInfo.name.slice(1)}s`,
-                    filename: `${shapeInfo.name}s.gcode`,
+                    filename: `${baseFilename}_${shapeInfo.name}s.gcode`,
                     code: gcode
                 });
             });
@@ -533,13 +789,13 @@
         // --- POINT CALCULATION HELPERS ---
         function generateSpiralPoints(p, center, targetRadius) {
             const xPoints = [], yPoints = [];
-            const totalAngle = p.numRotations * 2 * Math.PI; // This is now a maximum limit
+            const totalAngle = p.numRotations * 2 * Math.PI;
             xPoints.push(center.x); yPoints.push(center.y);
 
             let theta = 0.001;
             while (theta < totalAngle) {
                 const rSpiral = p.spiralTightness * theta;
-                if (rSpiral > targetRadius) break; // Stop if we exceed the target radius
+                if (rSpiral > targetRadius) break;
 
                 const xShifted = (rSpiral * Math.cos(theta)) + center.x;
                 const yShifted = (rSpiral * Math.sin(theta)) + center.y;
@@ -676,7 +932,7 @@
         function renderGCodeOutputs(files) {
             dom.gcodeOutputsContainer.innerHTML = '';
             if (files.length === 0) {
-                 dom.gcodeOutputsContainer.innerHTML = '<p>No G-code files to generate. Enable a shape type and click "Apply" to begin.</p>';
+                 dom.gcodeOutputsContainer.innerHTML = '<div class="output-group"><p>No G-code files to generate. Enable a shape type and click "Apply" to begin.</p></div>';
                  return;
             }
             files.forEach((file) => {
@@ -826,6 +1082,9 @@
         dom.inputs.gridRows.addEventListener('input', updateCellCenterInputs);
         dom.inputs.gridCols.addEventListener('input', updateCellCenterInputs);
         dom.inputs.gridSize.addEventListener('input', updateCellCenterInputs);
+
+        dom.inputs.laserWidth.addEventListener('input', updateOverlapAnalysis);
+        dom.inputs.spiralTightness.addEventListener('input', updateOverlapAnalysis);
 
         dom.presets.saveBtn.addEventListener('click', () => {
             const name = dom.inputs.presetName.value.trim();
