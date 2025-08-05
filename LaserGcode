@@ -246,6 +246,10 @@
                 <label for="grid-size">Total Bed Size (mm)</label>
                 <input type="number" id="grid-size" value="350">
             </div>
+             <div class="param-group">
+                <label for="num-passes">Number of Passes</label>
+                <input type="number" id="num-passes" value="1" min="1">
+            </div>
             <div class="param-group">
                 <label for="travel-speed">Travel Speed (mm/s)</label>
                 <input type="number" id="travel-speed" value="100">
@@ -391,6 +395,7 @@
             applyBtn: document.getElementById('apply-btn'),
             inputs: {
                 gridSize: document.getElementById('grid-size'),
+                numPasses: document.getElementById('num-passes'), // New
                 travelSpeed: document.getElementById('travel-speed'),
                 zHeight: document.getElementById('z-height'),
                 servoDelay: document.getElementById('servo-delay'),
@@ -538,7 +543,6 @@
                 square: { distance_mm: 0, time_s: 0 },
                 circle: { distance_mm: 0, time_s: 0 },
                 spiral: { distance_mm: 0, time_s: 0 },
-                total:  { distance_mm: 0, time_s: 0 }
             };
 
             const enabledShapes = config.shapes.filter(s => s.enabled).map(s => s.name);
@@ -549,27 +553,18 @@
                 const data = augmentedData[dataIndex++];
                 if (!data) return;
 
-                // --- Square ---
                 if (enabledShapes.includes('square')) {
-                    const dist = 8 * data.targetRadius; // Perimeter
+                    const dist = 8 * data.targetRadius;
                     const speed = cell.speeds.square;
                     analysis.square.distance_mm += dist;
-                    if (speed > 0) {
-                        analysis.square.time_s += dist / speed;
-                    }
+                    if (speed > 0) analysis.square.time_s += dist / speed;
                 }
-
-                // --- Circle ---
                 if (enabledShapes.includes('circle')) {
-                    const dist = 2 * Math.PI * data.targetRadius; // Circumference
+                    const dist = 2 * Math.PI * data.targetRadius;
                     const speed = cell.speeds.circle;
                     analysis.circle.distance_mm += dist;
-                    if (speed > 0) {
-                        analysis.circle.time_s += dist / speed;
-                    }
+                    if (speed > 0) analysis.circle.time_s += dist / speed;
                 }
-
-                // --- Spiral ---
                 if (enabledShapes.includes('spiral')) {
                     const points = data.spiralPoints;
                     let spiralLength = 0;
@@ -580,15 +575,24 @@
                     }
                     const speed = cell.speeds.spiral;
                     analysis.spiral.distance_mm += spiralLength;
-                    if (speed > 0) {
-                        analysis.spiral.time_s += spiralLength / speed;
-                    }
+                    if (speed > 0) analysis.spiral.time_s += spiralLength / speed;
                 }
             });
 
-            // Calculate Totals
-            analysis.total.distance_mm = analysis.square.distance_mm + analysis.circle.distance_mm + analysis.spiral.distance_mm;
-            analysis.total.time_s = analysis.square.time_s + analysis.circle.time_s + analysis.spiral.time_s;
+            // Multiply by number of passes
+            const numPasses = config.numPasses > 0 ? config.numPasses : 1;
+            analysis.square.distance_mm *= numPasses;
+            analysis.square.time_s *= numPasses;
+            analysis.circle.distance_mm *= numPasses;
+            analysis.circle.time_s *= numPasses;
+            analysis.spiral.distance_mm *= numPasses;
+            analysis.spiral.time_s *= numPasses;
+
+            // Calculate total after passes
+            analysis.total = {
+                distance_mm: analysis.square.distance_mm + analysis.circle.distance_mm + analysis.spiral.distance_mm,
+                time_s: analysis.square.time_s + analysis.circle.time_s + analysis.spiral.time_s
+            };
 
             return analysis;
         }
@@ -685,6 +689,7 @@
             const files = [];
             const f4 = (n) => n.toFixed(4);
             const baseFilename = presetName ? presetName.replace(/[\s/\\?%*:|"<>]/g, '_') : 'unnamed_preset';
+            const numPasses = config.numPasses > 0 ? config.numPasses : 1;
 
             config.shapes.forEach(shapeInfo => {
                 if (!shapeInfo.enabled) return;
@@ -705,73 +710,63 @@
                 gcode += `; ========================================\n`;
                 gcode += startScript + '\n';
 
+                // --- Build G-code for a single pass ---
+                let singlePassGcode = '';
                 let dataIndex = 0;
                 config.cellControls.forEach((cell, index) => {
                     if (!cell.enabled) return;
-
                     const data = augmentedData[dataIndex++];
                     if (!data) return;
 
                     const speedMms = cell.speeds[shapeInfo.name];
                     const speedMmm = speedMms * 60;
-
-                    gcode += `\n; --- Cell ${index + 1} (${cell.x}, ${cell.y}) ${shapeInfo.name} ---\n`;
+                    singlePassGcode += `\n; --- Cell ${index + 1} (${cell.x}, ${cell.y}) ${shapeInfo.name} ---\n`;
 
                     switch (shapeInfo.name) {
                         case 'square': {
                             const v = data.squareVertices;
-                            gcode += `G0 X${f4(v.bl.x)} Y${f4(v.bl.y)} F${travelSpeedMin}\n`;
-                            gcode += servoDelay;
-                            gcode += `${LASER_OPEN}\n`;
-                            gcode += servoDelay;
-                            gcode += `G1 X${f4(v.br.x)} Y${f4(v.br.y)} F${speedMmm}\n`;
-                            gcode += `G1 X${f4(v.tr.x)} Y${f4(v.tr.y)} F${speedMmm}\n`;
-                            gcode += `G1 X${f4(v.tl.x)} Y${f4(v.tl.y)} F${speedMmm}\n`;
-                            gcode += `G1 X${f4(v.bl.x)} Y${f4(v.bl.y)} F${speedMmm}\n`;
-                            gcode += servoDelay;
-                            gcode += `${LASER_CLOSE}\n`;
-                            gcode += servoDelay;
+                            singlePassGcode += `G0 X${f4(v.bl.x)} Y${f4(v.bl.y)} F${travelSpeedMin}\n`;
+                            singlePassGcode += servoDelay + `${LASER_OPEN}\n` + servoDelay;
+                            singlePassGcode += `G1 X${f4(v.br.x)} Y${f4(v.br.y)} F${speedMmm}\n`;
+                            singlePassGcode += `G1 X${f4(v.tr.x)} Y${f4(v.tr.y)} F${speedMmm}\n`;
+                            singlePassGcode += `G1 X${f4(v.tl.x)} Y${f4(v.tl.y)} F${speedMmm}\n`;
+                            singlePassGcode += `G1 X${f4(v.bl.x)} Y${f4(v.bl.y)} F${speedMmm}\n`;
+                            singlePassGcode += servoDelay + `${LASER_CLOSE}\n` + servoDelay;
                             break;
                         }
                         case 'circle': {
                             const startX = data.center.x + data.targetRadius;
                             const startY = data.center.y;
-                            gcode += `G0 X${f4(startX)} Y${f4(startY)} F${travelSpeedMin}\n`;
-                            gcode += servoDelay;
-                            gcode += `${LASER_OPEN}\n`;
-                            gcode += servoDelay;
-                            gcode += `G2 X${f4(startX)} Y${f4(startY)} I${f4(-data.targetRadius)} J0 F${speedMmm}\n`;
-                            gcode += servoDelay;
-                            gcode += `${LASER_CLOSE}\n`;
-                            gcode += servoDelay;
+                            singlePassGcode += `G0 X${f4(startX)} Y${f4(startY)} F${travelSpeedMin}\n`;
+                            singlePassGcode += servoDelay + `${LASER_OPEN}\n` + servoDelay;
+                            singlePassGcode += `G2 X${f4(startX)} Y${f4(startY)} I${f4(-data.targetRadius)} J0 F${speedMmm}\n`;
+                            singlePassGcode += servoDelay + `${LASER_CLOSE}\n` + servoDelay;
                             break;
                         }
                         case 'spiral': {
                             const points = data.spiralPoints;
                             if (points.x.length < 2) break;
-
-                            gcode += `G0 X${f4(points.x[0])} Y${f4(points.y[0])} F${travelSpeedMin}\n`;
-                            gcode += servoDelay;
-                            gcode += `${LASER_OPEN}\n`;
-                            gcode += servoDelay;
-                            gcode += `G1 X${f4(points.x[1])} Y${f4(points.y[1])} F${speedMmm}\n`;
-
+                            singlePassGcode += `G0 X${f4(points.x[0])} Y${f4(points.y[0])} F${travelSpeedMin}\n`;
+                            singlePassGcode += servoDelay + `${LASER_OPEN}\n` + servoDelay;
+                            singlePassGcode += `G1 X${f4(points.x[1])} Y${f4(points.y[1])} F${speedMmm}\n`;
                             for (let i = 2; i < points.x.length; i++) {
                                 const startPointAbs = { x: points.x[i - 1], y: points.y[i - 1] };
                                 const endPointAbs = { x: points.x[i], y: points.y[i] };
-
                                 const iOffset = data.center.x - startPointAbs.x;
                                 const jOffset = data.center.y - startPointAbs.y;
-
-                                gcode += `G3 X${f4(endPointAbs.x)} Y${f4(endPointAbs.y)} I${f4(iOffset)} J${f4(jOffset)} F${speedMmm}\n`;
+                                singlePassGcode += `G3 X${f4(endPointAbs.x)} Y${f4(endPointAbs.y)} I${f4(iOffset)} J${f4(jOffset)} F${speedMmm}\n`;
                             }
-                            gcode += servoDelay;
-                            gcode += `${LASER_CLOSE}\n`;
-                            gcode += servoDelay;
+                            singlePassGcode += servoDelay + `${LASER_CLOSE}\n` + servoDelay;
                             break;
                         }
                     }
                 });
+
+                // --- Repeat the single pass G-code block ---
+                for (let i = 0; i < numPasses; i++) {
+                    gcode += `\n; --- PASS ${i + 1} of ${numPasses} ---\n`;
+                    gcode += singlePassGcode;
+                }
 
                 gcode += `\n; --- End of Job ---\n`;
                 gcode += endScript + '\n';
